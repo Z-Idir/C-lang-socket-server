@@ -1,2 +1,18 @@
-./.vscode
-./.qodo
+# Editor / IDE settings
+.vscode/
+.qodo/
+
+# Build artifacts / binaries
+*.exe
+*.out
+*.dll
+*.obj
+*.o
+build/
+bin/
+
+# Keep source and README explicitly (only needed if some broader rule would catch them)
+!*.c
+!*.h
+!README.md
+!README

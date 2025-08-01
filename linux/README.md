@@ -1,0 +1,2 @@
+# basic structure
+so here we have this main folder under root as /linux, we have the files you see here mainly the server.c and client.c these will be the focus points, we have a makefile that will build the server but you can modify it to build any other file , we also have the playground subdir where there are some experimental programs that you should checkout
