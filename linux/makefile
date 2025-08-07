@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=gnu17 -g
 TARGET = server
-SRCS = server.c
+SRCS = server.c child_process_utils.c
 OBJS = $(SRCS:.c=.o)
 
 all: $(TARGET)

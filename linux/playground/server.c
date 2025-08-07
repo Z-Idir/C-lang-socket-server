@@ -102,7 +102,7 @@ int main(){
             close(sock); //close its copy of the server socket
             msgLen = strlen(msg);
             bytesSent = send(newSocket,msg,msgLen,0);
-            printf("bytes sent : %d , excpected to send : %d\n",bytesSent,msgLen);
+            printf("bytes sent : %ld , excpected to send : %d\n",bytesSent,msgLen);
             close(newSocket);// when done the client connection is closed
             exit(0);
         }else{//parent

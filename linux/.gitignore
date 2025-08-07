@@ -10,6 +10,9 @@
 *.o
 build/
 bin/
+client
+server
+showip
 
 # Keep source and README explicitly (only needed if some broader rule would catch them)
 !*.c
