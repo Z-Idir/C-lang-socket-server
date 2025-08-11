@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=gnu17 -g
+CFLAGS = -Wall -std=gnu17 -g
 TARGET = server
 SRCS = server.c child_process_utils.c
 OBJS = $(SRCS:.c=.o)

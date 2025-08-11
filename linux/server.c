@@ -15,30 +15,40 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <semaphore.h>
 
 #include "server.h"
 #include "child_process_utils.h"
 
+/*----CONSTANTS DEFINITIONS----*/
 #define PORT "2390"
 #define BACKLOG 10
 #define BUFF_SIZE 100
-#define MAX_CHILDREN 3
+#define MAX_CHILDREN 1
 #define SOCK_TIMEOUT 60
 #define CLIENT_CLOSE_MSG 2
+#define MAX_QUEUE_SIZE 2
 
+/*----FLAGS DEFINITIONS----*/
 volatile sig_atomic_t running = 1;
 volatile sig_atomic_t childRunning = 1;
+volatile sig_atomic_t rewind_handler = 1; // this will be used to wake the process to handle enqued connections
 
+/*----STRUCTURES DEFINITIONS----*/
+typedef struct {
+    int queue[MAX_QUEUE_SIZE];
+    int tail;
+    int head;
+    int count;
+} shared_queue_t ;
 
-void handleSigInt(int sig){
-    (void)sig;
-    running = 0;
-}
-
-void handleSigChild(int sig){
-    (void)sig;
-}
-
+/*----SYNOPSIS DEFINITIONS----*/
+void child_main(int ipc_sock, int index);
+void handleSigInt(int sig);
+void handleSigChild(int sig);
 void format_client_addresse(struct sockaddr *ca, char *out, size_t outlen);
 int server_should_run(void);
 ssize_t send_full(int socket_fd,char *buf,size_t buflen);
@@ -47,30 +57,44 @@ void handle_child_sig_int(int sig);
 void install_child_sig_handler(void);
 void cleanup_children(void);
 int response(int sock,char *request, ssize_t reqlen);
+static int send_file_descriptor(int socket,int fd_to_send);
+int recv_fd(int sock);
+void add_child(pid_t pid);
+void enqueue_connection(shared_queue_t *q, int fd);
+int dequeu_connection(shared_queue_t *q);
 
+/*----IPC MANAGEMENT----*/
 // pid_t children_pids[MAX_CHILDREN];
 pl *children_pids = NULL;
 int childrenCount = 0;
 
-void add_child(pid_t pid){
-    if (childrenCount <= MAX_CHILDREN){
-        printf("children count %d\n",childrenCount);
-        if(children_pids == NULL){
-            children_pids = create_process_node(pid);
-        }else {
-            add_process(pid,children_pids);
-        }
-        childrenCount++;
-    }
-    else{
-        perror("max number of children processes reached");
-    }
-}
+sem_t *mutex ,*items,*slots ;
+shared_queue_t *pending_queue;
+
+int child_index;
+
 
 int main(){
+    int ipc_pairs[MAX_CHILDREN][2];
+    // int sock_pair[2];
+
+    int ipc_establish_index = 0;
+    // socketpair(AF_UNIX,SOCK_STREAM,0,sock_pair);
+    mutex = sem_open("/mutex_sem",O_CREAT,0666,1);
+    items = sem_open("/items_sem",O_CREAT,0666,0);
+    slots = sem_open("/slots_sem",O_CREAT,0666,MAX_QUEUE_SIZE);
+
 
     install_sig_inter_handler();
     int sock = setup_listener(PORT);
+    int smfd = shm_open("/shared_queue",O_CREAT | O_RDWR,0666);
+    ftruncate(smfd,sizeof(shared_queue_t));
+    pending_queue = mmap(NULL,sizeof(shared_queue_t),PROT_READ | PROT_WRITE,MAP_SHARED,smfd,0);
+    pending_queue->head = 0;
+    pending_queue->tail = 0;
+    pending_queue->count = 0;
+    memset(pending_queue->queue,-1,sizeof(int[MAX_QUEUE_SIZE]));
+
 
     while (server_should_run()){
 
@@ -91,30 +115,50 @@ int main(){
             continue;
         }
         format_client_addresse((struct sockaddr *)&newAddress,ip,sizeof ip);
-        if(childrenCount >= MAX_CHILDREN){
-            fprintf(stderr,"too many clients...rejecting connection\n");
+        if(childrenCount < MAX_CHILDREN){
+            child_index = ipc_establish_index;
+            printf("going to fork anew\n");
+            printf("the accepted client on fork has sock <%d>\n",newSocket);
+            if(socketpair(AF_UNIX,SOCK_STREAM,0,ipc_pairs[child_index]) < -1){
+                perror("socketpair");
+                exit(EXIT_FAILURE);
+            }
+            ipc_establish_index++;
+            pid_t pid = fork();
+            if(pid < 0){
+                perror("fork");
+                close(newSocket);
+            }else if(pid == 0){ // child
+                close(sock); //close its copy of the server socket
+                // close(ipc_pairs[ipc_establish_index - 1][0]);
+                child_main(ipc_pairs[child_index][1],child_index);
+                // close(ipc_pairs[ipc_establish_index - 1][1]);
+                exit(0);
+            }else{//parent
+                add_child(pid);
+                char buff[] = "hellooo";
+                send(ipc_pairs[child_index][0],buff,sizeof(buff),0);
+                printf("spawned a child with pid :<%d>\n",pid);
+                close(newSocket); // close its copy of the client socket
+            }
+        }else {
+            int dupSock = dup(newSocket);
+            printf("connection going into queue sock <%d>\n",dupSock);
+            enqueue_connection(pending_queue, dupSock);
+            printf("connection went into queue\n");
             close(newSocket);
-            continue;
         }
-        pid_t pid = fork();
-        if(pid < 0){
-            perror("fork");
-            close(newSocket);
-        }else if(pid == 0){ // child
-            close(sock); //close its copy of the server socket
-            install_child_sig_handler();
-            handle_client(newSocket);
-            exit(0);
-        }else{//parent
-            add_child(pid);
-            printf("spawned a child with pid :<%d>\n",pid);
-            close(newSocket); // close its copy of the client socket
-        }
-        
+
     }
     printf("\nclosing server ...\n");
     cleanup_children();
     close(sock);
+
+    shm_unlink("/shared_queue");
+    sem_unlink("/slots_sem");
+    sem_unlink("/items_sem");
+    sem_unlink("/mutex_sem");
+
     return 0;
 }
 void install_sig_inter_handler(void){
@@ -216,51 +260,61 @@ int setup_listener(char *port){
     return sock;
 }
 void handle_client(int client_fd){
+
     struct timeval timeout = {.tv_sec = SOCK_TIMEOUT, .tv_usec =0};
     // timeout.tv_sec = SOCK_TIMEOUT;
     // timeout.tv_usec = 0;
     ssize_t bytesTransferred;
 
 
-    if(setsockopt(client_fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout)) < 0){
-        perror("setsockopt() : SO_RCVTIMEO");
-        close(client_fd);
-        return;
-    }
-
     char msg[BUFF_SIZE];
 
-    while (childRunning){
-        bytesTransferred = recv(client_fd,msg,sizeof msg,0);
-        if(bytesTransferred == 0){
-            //client closed
-            break;
+    
+    // do{
+        if(setsockopt(client_fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout)) < 0){
+            perror("setsockopt() : SO_RCVTIMEO");
+            close(client_fd);
+            exit(EXIT_FAILURE);
         }
-        if(bytesTransferred == -1){
-            if(errno == EINTR) continue;
-            if(errno == EAGAIN || errno == EWOULDBLOCK ) {
-                // timeout happened
-                printf("--client handler-- timeout reached without receiving data\n");
+        while (childRunning){
+            bytesTransferred = recv(client_fd,msg,sizeof msg,0);
+            if(bytesTransferred == 0){
+                //client closed
                 break;
             }
-            perror("recv");
-            break;
+            if(bytesTransferred == -1){
+                if(errno == EINTR) continue;
+                if(errno == EAGAIN || errno == EWOULDBLOCK ) {
+                    // timeout happened
+                    printf("--client handler-- timeout reached without receiving data\n");
+                    break;
+                }
+                perror("recv");
+                break;
+            }
+            printf("the message length is %ld\n",strlen(msg));
+            int res = response(client_fd,msg,bytesTransferred);
+            if(res == CLIENT_CLOSE_MSG){// the client sent the close message
+                close(client_fd);
+                break;
+            }
+            if(res == -1){
+                fprintf(stderr,"request incomprehensive, reqlen or req invalid\n");
+                continue;
+            }
+            //echo back what we received
+            // int msgLen ;
+            // msgLen = strlen(msg);
+            // bytesTransferred = send_full(client_fd,msg,msgLen);
+            // printf("--client handler--<%d> bytes sent : %ld , excpected to send : %d\n",getpid(),bytesTransferred,msgLen);
         }
-        printf("the message length is %ld\n",strlen(msg));
-        int res = response(client_fd,msg,bytesTransferred);
-        if(res == CLIENT_CLOSE_MSG){// the client sent the close message
-            break;
-        }
-        if(res == -1){
-            fprintf(stderr,"request incomprehensive, reqlen or req invalid\n");
-            continue;
-        }
-        //echo back what we received
-        // int msgLen ;
-        // msgLen = strlen(msg);
-        // bytesTransferred = send_full(client_fd,msg,msgLen);
-        // printf("--client handler--<%d> bytes sent : %ld , excpected to send : %d\n",getpid(),bytesTransferred,msgLen);
-    }
+
+        // printf("exited the starting handler now waiting for se elements\n");
+        // client_fd = dequeu_connection(pending_queue);
+        // printf("the client sock after dequeu is <%d>\n",client_fd);
+
+    // }while(rewind_handler);
+    
     fflush(stdout);
     close(client_fd);// when done the client connection is closed
     return ;
@@ -343,7 +397,8 @@ void install_child_sig_handler(void){
 }
 void handle_child_sig_int(int sig){
     (void)sig;
-    childRunning = 0; 
+    childRunning = 0;
+    rewind_handler = 0;
 }
 void cleanup_children(void){
     pid_t pid;
@@ -392,4 +447,126 @@ int response(int sock,char *request, ssize_t reqlen){
         send(sock,"Unknown command\n",16,0);
     }
     return 0;
+}
+static int send_file_descriptor(int socket,int fd_to_send){
+ struct msghdr message;
+ struct iovec iov[1];
+ struct cmsghdr *control_message = NULL;
+ char ctrl_buf[CMSG_SPACE(sizeof(int))];
+ char data[1];
+
+ memset(&message, 0, sizeof(struct msghdr));
+ memset(ctrl_buf, 0, CMSG_SPACE(sizeof(int)));
+
+ /* We are passing at least one byte of data so that recvmsg() will not return 0 */
+ data[0] = ' ';
+ iov[0].iov_base = data;
+ iov[0].iov_len = sizeof(data);
+
+ message.msg_name = NULL;
+ message.msg_namelen = 0;
+ message.msg_iov = iov;
+ message.msg_iovlen = 1;
+ message.msg_controllen =  CMSG_SPACE(sizeof(int));
+ message.msg_control = ctrl_buf;
+
+ control_message = CMSG_FIRSTHDR(&message);
+ control_message->cmsg_level = SOL_SOCKET;
+ control_message->cmsg_type = SCM_RIGHTS;
+ control_message->cmsg_len = CMSG_LEN(sizeof(int));
+
+ *((int *) CMSG_DATA(control_message)) = fd_to_send;
+
+ return sendmsg(socket, &message, 0);
+}
+int recv_fd(int sock) {
+    struct msghdr msg = {0};
+    char m_buffer[1];
+    struct iovec io = {.iov_base = m_buffer, .iov_len = sizeof(m_buffer)};
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    msg.msg_control = cmsgbuf;
+    msg.msg_controllen = sizeof(cmsgbuf);
+
+    if (recvmsg(sock, &msg, 0) < 0) {
+        perror("recvmsg");
+        return -1;
+    }
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int))) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+            int fd;
+            memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+            return fd;
+        }
+    }
+
+    return -1;
+}
+void child_main(int ipc_sock, int index){
+    (void)index;
+    install_child_sig_handler();
+    while(childRunning){
+        printf("child running %d\n",childRunning);
+        char buff[20];
+        recv_full(ipc_sock,buff, sizeof(buff));
+        printf("in child, received from the ipc sock -%s-\n",buff);
+        exit(0);
+        int newSocket = recv_fd(ipc_sock);
+        if(newSocket >= 0){
+            handle_client(newSocket);
+            // char msg = 'R';
+            // send()
+        }
+    }
+}
+
+void handleSigInt(int sig){
+    // this function handles main process interruption
+    (void)sig;
+    running = 0;
+}
+
+void handleSigChild(int sig){
+    (void)sig;
+}
+
+void add_child(pid_t pid){
+    if (childrenCount <= MAX_CHILDREN){
+        printf("children count %d\n",childrenCount);
+        if(children_pids == NULL){
+            children_pids = create_process_node(pid);
+        }else {
+            add_process(pid,children_pids);
+        }
+        childrenCount++;
+    }
+    else{
+        perror("max number of children processes reached");
+    }
+}
+
+void enqueue_connection(shared_queue_t *q, int fd){
+    sem_wait(slots);
+    sem_wait(mutex);
+    q->queue[q->tail] = fd;
+    q->tail = (q->tail + 1) % MAX_QUEUE_SIZE; // circular queue
+    q->count += 1;
+    sem_post(mutex);
+    sem_post(items);
+}
+
+int dequeu_connection(shared_queue_t *q){
+    int sock;
+    sem_wait(items);
+    sem_wait(mutex);
+    sock = q->queue[q->head];
+    q->head = (q->head + 1) % MAX_QUEUE_SIZE; // circular queue
+    q->count -= 1;
+    sem_post(mutex);
+    sem_post(slots);
+    return sock;
 }
