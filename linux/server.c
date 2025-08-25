@@ -58,7 +58,7 @@ void install_child_sig_handler(void);
 void cleanup_children(void);
 int response(int sock,char *request, ssize_t reqlen);
 static int send_file_descriptor(int socket,int fd_to_send);
-int recv_fd(int sock);
+static int recv_file_descriptor(int socket);
 void add_child(pid_t pid);
 void enqueue_connection(shared_queue_t *q, int fd);
 int dequeu_connection(shared_queue_t *q);
@@ -136,9 +136,8 @@ int main(){
                 exit(0);
             }else{//parent
                 add_child(pid);
-                char buff[] = "hellooo";
-                send(ipc_pairs[child_index][0],buff,sizeof(buff),0);
                 printf("spawned a child with pid :<%d>\n",pid);
+                send_file_descriptor(ipc_pairs[child_index][0],newSocket);
                 close(newSocket); // close its copy of the client socket
             }
         }else {
@@ -296,7 +295,7 @@ void handle_client(int client_fd){
             int res = response(client_fd,msg,bytesTransferred);
             if(res == CLIENT_CLOSE_MSG){// the client sent the close message
                 close(client_fd);
-                break;
+                exit(0);
             }
             if(res == -1){
                 fprintf(stderr,"request incomprehensive, reqlen or req invalid\n");
@@ -479,47 +478,17 @@ static int send_file_descriptor(int socket,int fd_to_send){
 
  return sendmsg(socket, &message, 0);
 }
-int recv_fd(int sock) {
-    struct msghdr msg = {0};
-    char m_buffer[1];
-    struct iovec io = {.iov_base = m_buffer, .iov_len = sizeof(m_buffer)};
-    msg.msg_iov = &io;
-    msg.msg_iovlen = 1;
-
-    char cmsgbuf[CMSG_SPACE(sizeof(int))];
-    msg.msg_control = cmsgbuf;
-    msg.msg_controllen = sizeof(cmsgbuf);
-
-    if (recvmsg(sock, &msg, 0) < 0) {
-        perror("recvmsg");
-        return -1;
-    }
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int))) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-            int fd;
-            memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
-            return fd;
-        }
-    }
-
-    return -1;
-}
 void child_main(int ipc_sock, int index){
     (void)index;
     install_child_sig_handler();
     while(childRunning){
-        printf("child running %d\n",childRunning);
-        char buff[20];
-        recv_full(ipc_sock,buff, sizeof(buff));
-        printf("in child, received from the ipc sock -%s-\n",buff);
-        exit(0);
-        int newSocket = recv_fd(ipc_sock);
+        int newSocket = recv_file_descriptor(ipc_sock);
+        printf("in child, received from the ipc sock -%d-\n",newSocket);
         if(newSocket >= 0){
             handle_client(newSocket);
-            // char msg = 'R';
-            // send()
+            close(newSocket);
+            char msg = 'R'; // ready message
+            send(ipc_sock,msg,1,0);
         }
     }
 }
@@ -569,4 +538,46 @@ int dequeu_connection(shared_queue_t *q){
     sem_post(mutex);
     sem_post(slots);
     return sock;
+}
+static int recv_file_descriptor(int socket) {
+    struct msghdr message;
+    struct iovec iov[1];
+    struct cmsghdr *control_message = NULL;
+    char ctrl_buf[CMSG_SPACE(sizeof(int))];
+    char data[1];
+    int received_fd = -1;
+
+    memset(&message, 0, sizeof(struct msghdr));
+    memset(ctrl_buf, 0, sizeof(ctrl_buf));
+
+    /* Same trick — we expect at least 1 byte of data */
+    iov[0].iov_base = data;
+    iov[0].iov_len = sizeof(data);
+
+    message.msg_name = NULL;
+    message.msg_namelen = 0;
+    message.msg_iov = iov;
+    message.msg_iovlen = 1;
+    message.msg_control = ctrl_buf;
+    message.msg_controllen = sizeof(ctrl_buf);
+
+    if (recvmsg(socket, &message, 0) < 0) {
+        perror("recvmsg");
+        return -1;
+    }
+
+    /* Walk the control messages looking for SCM_RIGHTS */
+    for (control_message = CMSG_FIRSTHDR(&message);
+         control_message != NULL;
+         control_message = CMSG_NXTHDR(&message, control_message)) {
+        
+        if ((control_message->cmsg_level == SOL_SOCKET) &&
+            (control_message->cmsg_type == SCM_RIGHTS)) {
+            
+            received_fd = *((int *) CMSG_DATA(control_message));
+            break;
+        }
+    }
+
+    return received_fd;
 }
